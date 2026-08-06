@@ -1,8 +1,11 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 import sqlite3
 import pandas as pd
 import io
+import os
 
 app = FastAPI()
 
@@ -42,21 +45,14 @@ async def upload_excel(file: UploadFile = File(...)):
         
         conn = sqlite3.connect(DB_FILE)
         cursor = conn.cursor()
-        
-        # Tự động dọn dẹp dữ liệu cũ mỗi khi nạp file mới
         cursor.execute("DELETE FROM records")
         
         success_count = 0
-        
-        # Quét qua tất cả các sheet trong file Excel
         for sheet_name in xls.sheet_names:
-            # Bỏ qua các sheet báo cáo tổng (không phải nhật ký lỗi hàng ngày)
             if sheet_name in ['产量', '汇总', 'Sheet1', 'Sheet2']:
                 continue
                 
             df = pd.read_excel(xls, sheet_name=sheet_name)
-            
-            # AI tìm kiếm cột tự động (dựa vào tên tiếng Trung)
             cus_idx, kg_idx, rolls_idx = None, None, None
             for row_idx in range(min(3, len(df))):
                 row_vals = df.iloc[row_idx].values.tolist()
@@ -66,7 +62,6 @@ async def upload_excel(file: UploadFile = File(...)):
                     if v == '重量': kg_idx = i
                     if v == '疋数': rolls_idx = i
             
-            # Nếu không tìm thấy cột Trọng lượng, bỏ qua sheet đó
             if kg_idx is None:
                 continue
                 
@@ -74,10 +69,8 @@ async def upload_excel(file: UploadFile = File(...)):
                 v = str(val).strip()
                 return '' if v.lower() in ['nan', 'none', 'nat'] else v
 
-            # Bóc tách dữ liệu theo đúng cấu trúc thực tế của file
             for i, row in df.iterrows():
                 date_val = clean(row.iloc[0])
-                # Chỉ xử lý những dòng nào cột đầu tiên là Ngày (vd: 2026.07.01)
                 if not (date_val.startswith('202') or date_val.startswith('07/')):
                     continue
                 
@@ -91,18 +84,8 @@ async def upload_excel(file: UploadFile = File(...)):
                     INSERT INTO records (date, lot, area, leader, operator, machine, shift, customer, errorType, kg, rolls, rework)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
-                    date_val,             # Ngày
-                    clean(row.iloc[2]),   # Lot (缸号)
-                    clean(row.iloc[5]),   # Area
-                    clean(row.iloc[6]),   # Leader
-                    clean(row.iloc[7]),   # Operator
-                    '',                   # Máy (bị gộp chung với Op)
-                    clean(row.iloc[8]),   # Shift
-                    clean(row.iloc[cus_idx]) if cus_idx is not None else '', # Customer
-                    clean(row.iloc[1]),   # Error Type
-                    kg_val,               # Kg
-                    rolls_val,            # Rolls
-                    clean(row.iloc[9])    # Rework (Y/N)
+                    date_val, clean(row.iloc[2]), clean(row.iloc[5]), clean(row.iloc[6]), clean(row.iloc[7]), '', clean(row.iloc[8]), 
+                    clean(row.iloc[cus_idx]) if cus_idx is not None else '', clean(row.iloc[1]), kg_val, rolls_val, clean(row.iloc[9])
                 ))
                 success_count += 1
                 
@@ -119,3 +102,17 @@ def get_records():
     records = conn.execute("SELECT * FROM records ORDER BY id DESC").fetchall()
     conn.close()
     return [dict(r) for r in records]
+
+# --- ĐOẠN CODE PHỤC VỤ GIAO DIỆN (ĐÃ FIX LỖI NOT FOUND) ---
+if os.path.isdir("dist"):
+    # Cấp quyền đọc các file thiết kế CSS, JS
+    if os.path.isdir("dist/assets"):
+        app.mount("/assets", StaticFiles(directory="dist/assets"), name="assets")
+    
+    # Bắt mọi đường dẫn và hiển thị web chính
+    @app.get("/{catchall:path}")
+    def serve_react(catchall: str):
+        file_path = os.path.join("dist", catchall)
+        if os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse("dist/index.html")
