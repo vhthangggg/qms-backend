@@ -1,16 +1,12 @@
 """
-QMS Dashboard — Backend FastAPI (bản sửa lỗi hoàn chỉnh)
-=========================================================
-Đã sửa:
-  1. KHÔNG xoá toàn bộ dữ liệu khi upload → chỉ xoá theo tháng có trong file
-  2. Xác thực mật khẩu ở SERVER (Bearer token)
-  3. Parse KG có dấu phẩy nghìn: "1,172.20" → 1172.2
-  4. Tách mã máy khỏi operator: "DH14 杜德忠" → machine="DH14", operator="杜德忠"
-  5. Customer: cột 14 (brand) + fallback dynamic search
-  6. UNIQUE constraint + INDEX trên bảng records
-  7. Validate file type (.xlsx/.xls)
-  8. Serve frontend từ dist/ cùng origin với API
-  9. Dùng lifespan thay vì @app.on_event (deprecated)
+QMS Dashboard — Backend FastAPI (Production-ready cho Render.com)
+==================================================================
+Các thay đổi cho Render:
+  - Port từ PORT env var
+  - Database path hỗ trợ Persistent Disk (/data/qms.db)
+  - Gunicorn-friendly (stateless)
+  - Health check endpoint
+  - CORS với domain Render
 """
 
 import io
@@ -21,70 +17,75 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pandas as pd
-from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 # ═══════════════════════════════════════════════════════
-# CẤU HÌNH
+# CẤU HÌNH TỪ ENVIRONMENT (Render inject)
 # ═══════════════════════════════════════════════════════
 
-DB_FILE = "qms.db"
+# Port do Render cung cấp (bắt buộc)
+PORT = int(os.environ.get("PORT", 8000))
 
-# Mật khẩu upload — nên dùng biến môi trường trong production:
-#   export QMS_UPLOAD_PASSWORD="vh@Thang"
+# Mật khẩu upload — KHÔNG hardcode trên production
 UPLOAD_PASSWORD = os.environ.get("QMS_UPLOAD_PASSWORD", "vh@Thang")
 
+# Domain ngoài của Render (ví dụ: https://qms.onrender.com)
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
+
+# Đường dẫn database — ưu tiên /data nếu có Persistent Disk
 BASE_DIR = Path(__file__).resolve().parent
 DIST_DIR = BASE_DIR / "dist"
 ASSETS_DIR = DIST_DIR / "assets"
 
-# Sheet tổng hợp / không chứa dữ liệu lỗi hàng ngày → bỏ qua
+# /data là mount point của Render Persistent Disk
+PERSISTENT_DIR = Path("/data")
+DB_FILE = (
+    PERSISTENT_DIR / "qms.db" if PERSISTENT_DIR.is_dir()
+    else BASE_DIR / "qms.db"
+)
+
+# ═══════════════════════════════════════════════════════
+# CẤU HÌNH NGHIỆP VỤ
+# ═══════════════════════════════════════════════════════
+
 SUMMARY_SHEETS = {"产量", "产量 (2)", "汇总", "Sheet1", "Sheet2", "合计", ""}
 
-# ─── Vị trí cột (đã đối chiếu dữ liệu thực tế T5 + T6/2026) ───
-COL_DATE       = 0   # 日期         2026.06.24
-COL_ERROR_TYPE = 1   # 問題類型     布重 / 克重 / 洗后縮率 …
-COL_LOT        = 2   # A (缸号)     DP6061703 / DJ6059364 …
-COL_DEPT       = 3   # 責任部門     V04.后整部
-COL_RESP       = 4   # 責任人       EC1427 / 吴国鹏 …
-COL_LEADER     = 5   # 责任车间/组   赵志红 / 莫志乾 …
-COL_SUBLEADER  = 6   # 组           李文玉 / 王文楼 …
-COL_OPERATOR   = 7   # 操作人       曾文行 / "DH14 杜德忠"
-COL_SHIFT      = 8   # 班别         A / B / N
-COL_REWORK     = 9   # 是否回修     Y / N
-# 10-13: mô tả / kết quả / xác nhận (không lưu vào DB)
-COL_CUSTOMER   = 14  # C (brand)    UNIQLO / AEO / TCP …
-COL_FACTORY    = 15  # D (factory)  晶苑益力 / REGENT …
-COL_KG         = 24  # 产量 (Kg)    1,172.20
-COL_ROLLS      = 25  # T (Rolls)    22.00
-MIN_COLS       = COL_ROLLS + 1       # tối thiểu 26 cột
+# Vị trí cột (đã đối chiếu dữ liệu T5 + T6/2026)
+COL_DATE       = 0
+COL_ERROR_TYPE = 1
+COL_LOT        = 2
+COL_DEPT       = 3
+COL_RESP       = 4
+COL_LEADER     = 5
+COL_SUBLEADER  = 6
+COL_OPERATOR   = 7
+COL_SHIFT      = 8
+COL_REWORK     = 9
+COL_CUSTOMER   = 14
+COL_FACTORY    = 15
+COL_KG         = 24
+COL_ROLLS      = 25
+MIN_COLS       = COL_ROLLS + 1
 
-# Regex tách mã máy: "DH14 杜德忠" → ("DH14", "杜德忠")
 MACHINE_RE = re.compile(r"^([A-Za-z]{2}\d{2})\s+(.+)$")
+DATE_RE    = re.compile(r"^(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})")
 
-# Regex parse ngày: 2026.05.02 / 2026-05-02 / 2026/05/02
-DATE_RE = re.compile(r"^(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})")
-
-# Từ khoá nhận diện khách hàng (fallback khi cột 14 trống)
 KNOWN_CUSTOMER_KEYWORDS = (
     "TORAY", "UNIQLO", "HANSAE", "AEO", "WALMART", "JCP", "CK",
     "FILA", "TCP", "LULULEMON", "A & F", "LACOSTE", "HUGO BOSS",
     "FRUIT", "BABATON", "SONOMA", "CAT & JACK", "LANDS", "MACY",
     "TARGET", "ADORE ME", "DULUTH", "LOLLYTOGS", "M&S", "PTT",
-    "ADDIS", "U-KNITS", "SAE-A", "SCAVI", "REGENT", "FASHION",
-    "HANSOLL", "COMTEXTI", "SHINSUNG", "SUY", "LEADING", "AMERICAN",
-    "MAXHILL", "NAM THUA",
+    "ADDIS", "U-KNITS", "SAE-A", "SCAVI", "REGENT", "HANSOLL",
 )
-
 
 # ═══════════════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════════════
 
 def clean(val) -> str:
-    """Trả về string đã strip; rỗng nếu NaN/None."""
     if val is None:
         return ""
     s = str(val).strip()
@@ -92,10 +93,6 @@ def clean(val) -> str:
 
 
 def normalize_date(raw):
-    """
-    Parse ngày → (iso_date 'YYYY-MM-DD', year_month 'YYYY-MM')
-    hoặc (None, None) nếu không hợp lệ.
-    """
     m = DATE_RE.match(str(raw).strip())
     if not m:
         return None, None
@@ -106,7 +103,6 @@ def normalize_date(raw):
 
 
 def parse_kg(val) -> float:
-    """Parse kg — xử lý dấu phẩy nghìn: '1,172.20' → 1172.2"""
     s = clean(val).replace(",", "").replace("，", "")
     try:
         return float(s) if s else 0.0
@@ -115,7 +111,6 @@ def parse_kg(val) -> float:
 
 
 def parse_rolls(val) -> int:
-    """Parse số cuộn → int."""
     s = clean(val).replace(",", "").replace("，", "")
     try:
         return int(float(s)) if s else 0
@@ -124,18 +119,11 @@ def parse_rolls(val) -> int:
 
 
 def split_operator_machine(raw: str):
-    """'DH14 杜德忠' → ('DH14', '杜德忠');  '曾文行' → ('', '曾文行')"""
     m = MACHINE_RE.match(raw)
-    if m:
-        return m.group(1), m.group(2)
-    return "", raw
+    return (m.group(1), m.group(2)) if m else ("", raw)
 
 
 def find_customer(row) -> str:
-    """
-    Ưu tiên cột 14. Nếu trống → tìm trong khoảng idx 13-17
-    giá trị chứa từ khoá khách hàng đã biết.
-    """
     customer = clean(row.iloc[COL_CUSTOMER]) if len(row) > COL_CUSTOMER else ""
     if customer:
         return customer
@@ -150,34 +138,47 @@ def find_customer(row) -> str:
 # DATABASE
 # ═══════════════════════════════════════════════════════
 
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
+def get_db():
+    """Tạo connection với timeout để tránh lock trên Render."""
+    conn = sqlite3.connect(str(DB_FILE), timeout=30)
     conn.execute("PRAGMA encoding = 'UTF-8'")
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS records (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            date       TEXT    NOT NULL,
-            lot        TEXT    DEFAULT '',
-            area       TEXT    DEFAULT '',
-            leader     TEXT    DEFAULT '',
-            operator   TEXT    DEFAULT '',
-            machine    TEXT    DEFAULT '',
-            shift      TEXT    DEFAULT '',
-            customer   TEXT    DEFAULT '',
-            error_type TEXT    DEFAULT '',
-            kg         REAL    DEFAULT 0,
-            rolls      INTEGER DEFAULT 0,
-            rework     TEXT    DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE(date, lot, error_type, shift)
-        )
-    """)
-    for col in ("date", "customer", "error_type", "leader", "area"):
-        conn.execute(
-            f"CREATE INDEX IF NOT EXISTS idx_{col} ON records({col})"
-        )
-    conn.commit()
-    conn.close()
+    conn.execute("PRAGMA journal_mode = WAL")  # Write-Ahead Logging
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+def init_db():
+    """Khởi tạo DB — tạo thư mục /data nếu chưa có."""
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+    
+    conn = get_db()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS records (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                date       TEXT    NOT NULL,
+                lot        TEXT    DEFAULT '',
+                area       TEXT    DEFAULT '',
+                leader     TEXT    DEFAULT '',
+                operator   TEXT    DEFAULT '',
+                machine    TEXT    DEFAULT '',
+                shift      TEXT    DEFAULT '',
+                customer   TEXT    DEFAULT '',
+                error_type TEXT    DEFAULT '',
+                kg         REAL    DEFAULT 0,
+                rolls      INTEGER DEFAULT 0,
+                rework     TEXT    DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(date, lot, error_type, shift)
+            )
+        """)
+        for col in ("date", "customer", "error_type", "leader", "area"):
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{col} ON records({col})"
+            )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 # ═══════════════════════════════════════════════════════
@@ -187,17 +188,51 @@ def init_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    print(f"🚀 QMS Dashboard started — DB at {DB_FILE}")
     yield
 
 app = FastAPI(title="QMS Dashboard API", lifespan=lifespan)
 
+# CORS — cho phép domain Render của bạn + localhost (dev)
+ALLOWED_ORIGINS = [
+    RENDER_URL,
+    "http://localhost:5173",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+]
+# Nếu bạn có domain custom, thêm vào đây:
+# ALLOWED_ORIGINS.append("https://yourdomain.com")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ═══════════════════════════════════════════════════════
+# HEALTH CHECK (Render dùng để monitor)
+# ═══════════════════════════════════════════════════════
+
+@app.get("/health")
+def health_check():
+    """Endpoint để Render health check."""
+    try:
+        conn = get_db()
+        count = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+        conn.close()
+        return {
+            "status": "healthy",
+            "records_count": count,
+            "db_path": str(DB_FILE),
+            "persistent_disk": PERSISTENT_DIR.is_dir(),
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"status": "unhealthy", "error": str(e)},
+        )
 
 
 # ═══════════════════════════════════════════════════════
@@ -209,25 +244,23 @@ async def upload_excel(
     file: UploadFile = File(...),
     authorization: str = Header(None),
 ):
-    # ── 1. Xác thực (FIX #2) ──────────────────────────
     if authorization != f"Bearer {UPLOAD_PASSWORD}":
         raise HTTPException(
             status_code=401,
             detail="Sai mật khẩu hoặc thiếu Authorization header",
         )
 
-    # ── 2. Validate file type ─────────────────────────
     if not file.filename or not file.filename.lower().endswith((".xlsx", ".xls")):
-        raise HTTPException(status_code=400, detail="Chỉ chấp nhận file Excel (.xlsx/.xls)")
+        raise HTTPException(status_code=400, detail="Chỉ chấp nhận file Excel")
 
     conn = None
     try:
         contents = await file.read()
         xls = pd.ExcelFile(io.BytesIO(contents), engine="openpyxl")
 
-        parsed_rows: list[tuple] = []
-        months_in_file: set[str] = set()
-        sheet_reports: list[dict] = []
+        parsed_rows = []
+        months_in_file = set()
+        sheet_reports = []
 
         for sheet_name in xls.sheet_names:
             if sheet_name in SUMMARY_SHEETS:
@@ -235,7 +268,6 @@ async def upload_excel(
 
             df = pd.read_excel(xls, sheet_name=sheet_name, header=None)
 
-            # Sheet không đủ cột → bỏ qua
             if df.shape[1] < MIN_COLS:
                 sheet_reports.append({
                     "sheet": sheet_name,
@@ -246,43 +278,31 @@ async def upload_excel(
 
             rows_in_sheet = 0
             for _, row in df.iterrows():
-                # Parse ngày — dòng tiêu đề / tổng kết sẽ có date=None → skip
                 iso_date, year_month = normalize_date(row.iloc[COL_DATE])
                 if iso_date is None:
                     continue
 
                 lot = clean(row.iloc[COL_LOT])
                 if not lot:
-                    continue  # không có Lot → không phải bản ghi lỗi
+                    continue
 
                 error_type = clean(row.iloc[COL_ERROR_TYPE])
                 shift      = clean(row.iloc[COL_SHIFT]).upper()
                 rework     = clean(row.iloc[COL_REWORK]).upper()
 
-                # Tách mã máy khỏi operator (FIX: machine luôn trống)
                 raw_operator = clean(row.iloc[COL_OPERATOR])
                 machine, operator = split_operator_machine(raw_operator)
 
-                # Customer (FIX: dynamic search fallback)
                 customer = find_customer(row)
-
-                # KG / Rolls (FIX: dấu phẩy nghìn)
                 kg_val    = parse_kg(row.iloc[COL_KG])
                 rolls_val = parse_rolls(row.iloc[COL_ROLLS])
 
                 parsed_rows.append((
-                    iso_date,                              # date
-                    lot,                                   # lot
-                    clean(row.iloc[COL_DEPT]),             # area (責任部門)
-                    clean(row.iloc[COL_LEADER]),           # leader (责任车间)
-                    operator,                              # operator
-                    machine,                               # machine
-                    shift,                                 # shift
-                    customer,                              # customer
-                    error_type,                            # error_type
-                    kg_val,                                # kg
-                    rolls_val,                             # rolls
-                    rework,                                # rework
+                    iso_date, lot,
+                    clean(row.iloc[COL_DEPT]),
+                    clean(row.iloc[COL_LEADER]),
+                    operator, machine, shift, customer, error_type,
+                    kg_val, rolls_val, rework,
                 ))
                 months_in_file.add(year_month)
                 rows_in_sheet += 1
@@ -293,8 +313,8 @@ async def upload_excel(
                 "reason": None,
             })
 
-        # ── 3. Ghi vào DB (FIX #1: xoá theo tháng, không xoá hết) ──
-        conn = sqlite3.connect(DB_FILE)
+        # Ghi vào DB
+        conn = get_db()
         cursor = conn.cursor()
 
         for ym in months_in_file:
@@ -303,7 +323,7 @@ async def upload_excel(
             )
 
         cursor.executemany(
-            """INSERT INTO records
+            """INSERT OR IGNORE INTO records
                (date, lot, area, leader, operator, machine,
                 shift, customer, error_type, kg, rolls, rework)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -324,11 +344,11 @@ async def upload_excel(
         }
 
     except Exception as e:
-        if conn is not None:
+        if conn:
             conn.rollback()
         return {"status": "error", "message": str(e)}
     finally:
-        if conn is not None:
+        if conn:
             conn.close()
 
 
@@ -338,7 +358,7 @@ async def upload_excel(
 
 @app.get("/api/records")
 def get_records():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db()
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(
@@ -351,7 +371,7 @@ def get_records():
 
 @app.get("/api/summary")
 def get_summary():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db()
     conn.row_factory = sqlite3.Row
     try:
         total       = conn.execute("SELECT COUNT(*) c FROM records").fetchone()["c"]
@@ -372,10 +392,9 @@ def get_summary():
 
 @app.delete("/api/records")
 def delete_all_records(authorization: str = Header(None)):
-    """Xoá toàn bộ dữ liệu (cần xác thực)."""
     if authorization != f"Bearer {UPLOAD_PASSWORD}":
         raise HTTPException(status_code=401, detail="Unauthorized")
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db()
     try:
         conn.execute("DELETE FROM records")
         conn.commit()
@@ -385,7 +404,7 @@ def delete_all_records(authorization: str = Header(None)):
 
 
 # ═══════════════════════════════════════════════════════
-# SERVE FRONTEND (dist/)
+# SERVE FRONTEND
 # ═══════════════════════════════════════════════════════
 
 if ASSETS_DIR.is_dir():
@@ -396,4 +415,18 @@ def serve_index():
     index_file = DIST_DIR / "index.html"
     if index_file.is_file():
         return FileResponse(str(index_file))
-    return {"detail": "dist/index.html không tồn tại — chỉ có API tại /api/*"}
+    return {"detail": "dist/index.html không tồn tại"}
+
+
+# ═══════════════════════════════════════════════════════
+# ENTRYPOINT (khi chạy trực tiếp bằng uvicorn)
+# ═══════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=PORT,
+        log_level="info",
+    )
